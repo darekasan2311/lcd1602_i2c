@@ -10,6 +10,7 @@
 #define I2C_MASTER_SDA_IO       21
 #define I2C_MASTER_FREQ_HZ      100000
 #define LCD_I2C_ADDRESS         0x27 // I2C address of LCD
+#define SCD4x_I2C_ADDRESS       0x62
 
 // LCD Commands
 #define LCD_CLEARDISPLAY        0x01
@@ -32,11 +33,13 @@
 #define PIN_RW                  0x02     // Read/Write bit
 #define PIN_RS                  0x01     // Register select bit
 
-i2c_master_dev_handle_t dev_handle;
-i2c_master_bus_handle_t bus_handle;
+static i2c_master_dev_handle_t lcd_handle;
+static i2c_master_dev_handle_t scd_handle;
+static i2c_master_bus_handle_t bus_handle;
 
 static uint8_t state_backlight = PIN_BACKLIGHT; // DEFAULT ON
 
+static void add_i2c_dev(uint8_t address, i2c_master_dev_handle_t *dev_handle, const char *device_name);
 
 void i2c_init(void)
 {
@@ -51,25 +54,43 @@ void i2c_init(void)
 
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_mst_config, &bus_handle));
 
+    add_i2c_dev(LCD_I2C_ADDRESS, &lcd_handle, "LCD1602");
+    add_i2c_dev(SCD4x_I2C_ADDRESS, &scd_handle, "SCD4x");
+}
+
+static void add_i2c_dev(uint8_t address, i2c_master_dev_handle_t *dev_handle, const char *device_name)
+{
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = LCD_I2C_ADDRESS,
+        .device_address = address,
         .scl_speed_hz = I2C_MASTER_FREQ_HZ,
     };
 
-    if (i2c_master_bus_add_device(bus_handle, &dev_cfg, &dev_handle) != ESP_OK)
-    {
-        ESP_LOGE("I2C", "ADDING DEVICE FAILED");
-    }
-    else
-    {
-        ESP_LOGI("I2C", "DEVICE ADDED SUCCESSFULLY");
-    };
+        esp_err_t ret = i2c_master_probe(bus_handle, address, pdMS_TO_TICKS(250));
+        if (ret == ESP_OK)
+        {
+            ESP_LOGI("I2C", "Found device at 0x%02X", address);
+            esp_err_t add_ok = i2c_master_bus_add_device(bus_handle, &dev_cfg, dev_handle);
+            if (add_ok != ESP_OK)
+            {
+                ESP_LOGE("I2C", "Adding device %s (0x%02X) failed: %s",
+                        device_name, address, esp_err_to_name(ret));
+            }
+            else
+            {
+                ESP_LOGI("I2C", "Device %s (0x%02X) added successfully",
+                        device_name, address);
+            }
+        } else {
+            ESP_LOGE("I2C", "Device not found at 0x%02X", address);
+            ESP_LOGE("I2C", "Abort adding device.");
+        }
+    
 }
 
 static void lcd_send_byte(uint8_t data)
 {
-    i2c_master_transmit(dev_handle, &data, 1, -1);
+    i2c_master_transmit(lcd_handle, &data, 1, -1);
 }
 
 static void lcd_pulse(uint8_t data)
@@ -171,6 +192,6 @@ void app_main(void)
 {
     i2c_init();
     lcd_init();
-    lcd_printf(0, 0, "Hello, world");
-    lcd_printf(1, 0, "Volt: %.2fV", 3.30);
+    lcd_printf(0, 0, "Added dev on %x", LCD_I2C_ADDRESS);
+    lcd_printf(1, 0, "Added dev on %x", SCD4x_I2C_ADDRESS);
 }
