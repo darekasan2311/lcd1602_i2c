@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
@@ -18,6 +19,17 @@
 #define LCD_INPUTSET            0x04
 #define LCD_SET_DDRAM_ADR       0x80
 
+// SCD41 Commands
+#define SCD41_CMD_START_PERIODIC_MEASUREMENT 0x21B1
+#define SCD41_CMD_READ_MEASUREMENT 0xEC05
+#define SCD41_CMD_STOP_PERIODIC_MEASUREMENT 0x3F86
+#define SCD41_CMD_GET_SERIAL_NUMBER 0x3682
+#define SCD41_CMD_PERFORM_SELF_TEST 0x3639
+
+// Timing delays for SCD41
+#define SCD41_MEASUREMENT_DELAY_MS 5000  // 5 seconds between measurements
+#define SCD41_CMD_DELAY_MS 1             // 1ms command execution time
+
 // Rows
 #define LCD_ROW1                0x00
 #define LCD_ROW2                0x40
@@ -32,6 +44,8 @@
 #define PIN_ENABLE              0x04     // Enable bit
 #define PIN_RW                  0x02     // Read/Write bit
 #define PIN_RS                  0x01     // Register select bit
+
+static const char *TAG = "SCD41";
 
 static i2c_master_dev_handle_t lcd_handle;
 static i2c_master_dev_handle_t scd_handle;
@@ -188,10 +202,180 @@ void lcd_printf(uint8_t row, uint8_t col, const char *fmt, ...)
     lcd_print(buffer);
 }
 
+// CRC-8 calculation (polynomial: 0x31, init: 0xFF)
+static uint8_t calculate_crc(uint8_t *data, size_t len) {
+    uint8_t crc = 0xFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t bit = 8; bit > 0; --bit) {
+            if (crc & 0x80)
+                crc = (crc << 1) ^ 0x31;
+            else
+                crc = (crc << 1);
+        }
+    }
+    return crc;
+}
+
+// Send command to SCD41
+esp_err_t scd41_send_command(uint16_t cmd) {
+    uint8_t buf[2];
+    buf[0] = (cmd >> 8) & 0xFF;  // MSB
+    buf[1] = cmd & 0xFF;          // LSB
+
+    esp_err_t ret = i2c_master_transmit(scd_handle, buf, 2, -1);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send command 0x%04X: %s", cmd, esp_err_to_name(ret));
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(SCD41_CMD_DELAY_MS));
+    return ESP_OK;
+}
+
+// Start periodic measurement
+esp_err_t scd41_start_periodic_measurement(void) {
+    esp_err_t ret = scd41_send_command(SCD41_CMD_START_PERIODIC_MEASUREMENT);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Periodic measurement started");
+    }
+    return ret;
+}
+
+// Stop periodic measurement
+esp_err_t scd41_stop_periodic_measurement(void) {
+    esp_err_t ret = scd41_send_command(SCD41_CMD_STOP_PERIODIC_MEASUREMENT);
+    if (ret == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(500));  // Wait for stop command to complete
+        ESP_LOGI(TAG, "Periodic measurement stopped");
+    }
+    return ret;
+}
+
+// Read measurement data (CO2, Temperature, Humidity)
+esp_err_t scd41_read_measurement(uint16_t *co2, float *temperature, float *humidity) {
+    esp_err_t ret;
+    uint8_t cmd_buf[2];
+    uint8_t data[9];  // 3 words × 3 bytes (2 data + 1 CRC)
+
+    // Send read measurement command
+    cmd_buf[0] = (SCD41_CMD_READ_MEASUREMENT >> 8) & 0xFF;
+    cmd_buf[1] = SCD41_CMD_READ_MEASUREMENT & 0xFF;
+
+    ret = i2c_master_transmit(scd_handle, cmd_buf, 2, -1);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send read command: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));  // Wait for data to be ready
+
+    // Read 9 bytes (CO2, Temp, RH with CRCs)
+    ret = i2c_master_receive(scd_handle, data, 9, -1);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read measurement: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Verify CRCs and extract data
+    for (int i = 0; i < 3; i++) {
+        uint8_t crc = calculate_crc(&data[i * 3], 2);
+        if (crc != data[i * 3 + 2]) {
+            ESP_LOGE(TAG, "CRC error at word %d", i);
+            return ESP_ERR_INVALID_CRC;
+        }
+    }
+
+    // Extract CO2 (ppm)
+    *co2 = (data[0] << 8) | data[1];
+
+    // Extract Temperature (°C) = -45 + 175 * (value / 65536)
+    uint16_t temp_raw = (data[3] << 8) | data[4];
+    *temperature = -45.0f + 175.0f * (temp_raw / 65536.0f);
+
+    // Extract Humidity (%RH) = 100 * (value / 65536)
+    uint16_t hum_raw = (data[6] << 8) | data[7];
+    *humidity = 100.0f * (hum_raw / 65536.0f);
+
+    return ESP_OK;
+}
+
+// Get serial number
+esp_err_t scd41_get_serial_number(uint64_t *serial) {
+    esp_err_t ret;
+    uint8_t cmd_buf[2];
+    uint8_t data[9];  // 3 words × 3 bytes
+
+    cmd_buf[0] = (SCD41_CMD_GET_SERIAL_NUMBER >> 8) & 0xFF;
+    cmd_buf[1] = SCD41_CMD_GET_SERIAL_NUMBER & 0xFF;
+
+    ret = i2c_master_transmit(scd_handle, cmd_buf, 2, -1);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    ret = i2c_master_receive(scd_handle, data, 9, -1);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // Verify CRCs
+    for (int i = 0; i < 3; i++) {
+        uint8_t crc = calculate_crc(&data[i * 3], 2);
+        if (crc != data[i * 3 + 2]) {
+            return ESP_ERR_INVALID_CRC;
+        }
+    }
+
+    // Combine into 48-bit serial number
+    *serial = ((uint64_t)data[0] << 40) | ((uint64_t)data[1] << 32) |
+              ((uint64_t)data[3] << 24) | ((uint64_t)data[4] << 16) |
+              ((uint64_t)data[6] << 8) | data[7];
+
+    return ESP_OK;
+}
+
+static void scd41_print(void) 
+{
+    uint16_t co2;
+    float temperature, humidity;
+
+    if (scd41_read_measurement(&co2, &temperature, &humidity) == ESP_OK) {
+        ESP_LOGI(TAG, "CO2: %d ppm, Temperature: %.2f °C, Humidity: %.2f %%RH",
+                    co2, temperature, humidity);
+    } else {
+        ESP_LOGW(TAG, "Failed to read measurement");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(SCD41_MEASUREMENT_DELAY_MS));
+}
+
 void app_main(void)
 {
+    uint64_t serial;
+
     i2c_init();
     lcd_init();
-    lcd_printf(0, 0, "Added dev on %x", LCD_I2C_ADDRESS);
-    lcd_printf(1, 0, "Added dev on %x", SCD4x_I2C_ADDRESS);
+
+    vTaskDelay(pdMS_TO_TICKS(SCD41_MEASUREMENT_DELAY_MS));
+
+        // Get serial number
+    if (scd41_get_serial_number(&serial) == ESP_OK) {
+        ESP_LOGI(TAG, "Serial Number: 0x%012llX", serial);
+    }
+    lcd_printf(0, 0, "Serial Number:");
+    lcd_printf(1, 0, "0x%012llX", serial);
+
+    // Start periodic measurements
+    ESP_ERROR_CHECK(scd41_start_periodic_measurement());
+
+    // Wait for first measurement (5 seconds)
+    ESP_LOGI(TAG, "Waiting for first measurement...");
+    vTaskDelay(pdMS_TO_TICKS(SCD41_MEASUREMENT_DELAY_MS));
+
+    while(1) {
+        scd41_print();
+    }
 }
